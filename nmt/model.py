@@ -107,11 +107,15 @@ class Model(nn.Module):
 
         decoder_inputs = self.get_input(trg_toks, is_src=False)
         decoder_outputs = self.decoder(decoder_inputs, decoder_mask, encoder_outputs, encoder_mask)
-        
+
+        # Compute P(good=1). If good=1, then continue to generate
+        # a target word. If good=0, then generate BAD.
         pg = F.sigmoid(self.bad_affine(decoder_outputs)) # bsz x 1
         ut.get_logger().info("P(good): {}".format(pg))
-        pg = 0.5 + 0.5*pg
+        pg = 0.5 + 0.5*pg # bias towards good
         pg = torch.log(pg)
+
+        # Generate target word
         logits = self.logit_fn(decoder_outputs) # bsz x vocab
         neglprobs = F.log_softmax(logits, -1) + pg.reshape(-1, 1)
         neglprobs = neglprobs * self.trg_vocab_mask.type(neglprobs.type()).reshape(1, -1)
