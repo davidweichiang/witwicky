@@ -59,6 +59,9 @@ class Trainer(object):
 
         # get model
         self.model = Model(self.config).to(self.device)
+        if args.model_file is not None:
+            self.logger.info('Restore model from {}'.format(args.model_file))
+            self.model.load_state_dict(torch.load(args.model_file))
 
         param_count = sum([numpy.prod(p.size()) for p in self.model.parameters()])
         self.logger.info('Model has {:,} parameters'.format(param_count))
@@ -157,6 +160,64 @@ class Trainer(object):
             self.logger.info('   acc sec/batch:   {0:.2f}'.format(acc_speed_time))
             self.logger.info('   global norm:     {0:.2f}'.format(global_norm))
 
+    def run_discriminative(self, src_toks, trg_toks, targets, num_samples):
+        #torch.autograd.set_detect_anomaly(True)
+
+        start = time.time()
+
+        src_toks_cuda = src_toks.to(self.device)
+        trg_toks_cuda = trg_toks.to(self.device)
+        targets_cuda = targets.to(self.device)
+
+        self.logger.info("Discriminative phase")
+
+        # Positive example
+        gold_nll = self.model(src_toks_cuda, trg_toks_cuda, targets_cuda)['loss']
+        gold_lr = self.model.length_reward*(targets_cuda != ac.PAD_ID).sum()
+        self.logger.info("    gold: {} (score={})".format(
+            self.validator._ids_to_trans(targets_cuda[0].tolist()),
+            -gold_nll+gold_lr))
+
+        # Generate negative samples
+
+        samples = self.model.beam_decode(src_toks_cuda, mode='random_particle', beam_size=num_samples)
+        # If the samples aren't weighted, supply uniform weights
+        for sample in samples:
+            if 'weights' not in sample:
+                sample['weights'] = torch.ones(num_samples, device=sample['scores'].device).float() / num_samples
+        assert len(samples) == 1
+        samples = samples[0]
+
+        sample_lengths = (samples['symbols'] != ac.EOS_ID).sum(dim=-1) + 1
+        for i in range(num_samples):
+            self.logger.info('    sample: {} (weight={}, score={})'.format(
+                self.validator._ids_to_trans(samples['symbols'][i].tolist()), 
+                samples['weights'][i], 
+                samples['scores'][i]))
+
+        loss = gold_nll - gold_lr + (samples['scores']*samples['weights']).sum()
+
+        if self.normalize_loss == ac.LOSS_TOK:
+            opt_loss = loss / (targets_cuda != ac.PAD_ID).type(loss.type()).sum()
+        elif self.normalize_loss == ac.LOSS_BATCH:
+            opt_loss = loss / targets_cuda.size()[0].type(loss.type())
+        else:
+            opt_loss = loss
+
+        self.optimizer.zero_grad()
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['grad_clip'])
+        self.adjust_lr()
+        self.optimizer.step()
+
+        self.logger.info('   time:               {}'.format(time.time() - start))
+        self.logger.info('   length reward grad: {}'.format(self.model.length_reward.grad))
+        self.logger.info('   length reward:      {}'.format(self.model.length_reward.item()))
+        #self.logger.info('   bad weights:     {}'.format(self.model.bad_affine.weight))
+        self.logger.info('   good bias grad:     {}'.format(self.model.bad_affine.bias.grad))
+        self.logger.info('   good bias:          {}'.format(self.model.bad_affine.bias.item()))
+
     def adjust_lr(self):
         if self.config['warmup_style'] == ac.ORG_WARMUP:
             step = self.num_batches_done + 1.0
@@ -193,7 +254,8 @@ class Trainer(object):
 
     def train(self):
         self.model.train()
-        for e in range(self.max_epochs):
+        #for e in range(self.max_epochs):
+        for e in range(0):
             b = 0
             for batch_data in self.data_manager.get_batch(mode=ac.TRAINING, num_preload=self.num_preload):
                 b += 1
@@ -205,9 +267,15 @@ class Trainer(object):
             if self.val_per_epoch and (e + 1) % self.validate_freq == 0:
                 self.maybe_validate(just_validate=True)
 
-        # validate 1 last time
-        if not self.config['val_by_bleu']:
-            self.maybe_validate(just_validate=True)
+        """for p in self.model.parameters():
+            if p is self.model.length_reward:
+                self.logger.info("not freezing length reward")
+            elif p is self.model.bad_affine.weight:
+                self.logger.info("not freezing p(BAD) weights")
+            elif p is self.model.bad_affine.bias:
+                self.logger.info("not freezing p(BAD) bias")
+            else:
+                p.requires_grad = False"""
 
         self.logger.info('It is finally done, mate!')
         self.logger.info('Train smoothed perps:')
@@ -219,6 +287,23 @@ class Trainer(object):
 
         self.logger.info('Save final checkpoint')
         self.save_checkpoint()
+
+        d = 1./self.model.bad_affine.weight.size(1)**0.5
+        torch.nn.init.uniform_(self.model.bad_affine.weight, -d, d)
+        torch.nn.init.uniform_(self.model.bad_affine.bias, -d, d)
+
+        for e in range(10):
+            #for b, batch_data in enumerate(self.data_manager.get_batch(mode=ac.TRAINING, num_preload=self.num_preload)):
+            for b, batch_data in enumerate(self.data_manager.get_batch(mode=ac.VALIDATING, num_preload=self.num_preload)):
+                src_toks, trg_toks, targets = batch_data
+                bsz = src_toks.size()[0]
+                for i in range(bsz):
+                    self.run_discriminative(src_toks[i:i+1], 
+                                            trg_toks[i:i+1], 
+                                            targets[i:i+1], max(1,bsz//5))
+                if (b+1) % 10 == 0:
+                    self.maybe_validate(just_validate=True)
+        self.maybe_validate(just_validate=True)
 
         # Evaluate on test
         test_file = self.data_manager.data_files[ac.TESTING][self.data_manager.src_lang]

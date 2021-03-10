@@ -27,8 +27,9 @@ class Model(nn.Module):
         if not learned_pos:
             self.pos_embedding = ut.get_positional_encoding(embed_dim, max_pos_length)
         else:
-            self.pos_embedding = Parameter(torch.Tensor(max_pos_length, embed_dim))
-            nn.init.normal_(self.pos_embedding, mean=0, std=embed_dim ** -0.5)
+            pos_embedding = Parameter(torch.Tensor(max_pos_length, embed_dim))
+            nn.init.normal_(pos_embedding, mean=0, std=embed_dim ** -0.5)
+            self.pos_embedding = (F.normalize(pos_embedding, dim=0) * (embed_dim/2)**0.5).to('cuda').detach()
 
         # get word embeddings
         src_vocab_size, trg_vocab_size = ut.get_vocab_sizes(self.config)
@@ -79,6 +80,9 @@ class Model(nn.Module):
                 else:
                     nn.init.constant_(p, 0.)
 
+        self.length_reward = Parameter(torch.tensor(0.))
+        self.bad_affine = nn.Linear(embed_dim, 1, bias=True)
+
     def get_input(self, toks, is_src=True):
         embeds = self.src_embedding if is_src else self.trg_embedding
         word_embeds = embeds(toks) # [bsz, max_len, embed_dim]
@@ -103,9 +107,13 @@ class Model(nn.Module):
 
         decoder_inputs = self.get_input(trg_toks, is_src=False)
         decoder_outputs = self.decoder(decoder_inputs, decoder_mask, encoder_outputs, encoder_mask)
-
-        logits = self.logit_fn(decoder_outputs)
-        neglprobs = F.log_softmax(logits, -1)
+        
+        pg = F.sigmoid(self.bad_affine(decoder_outputs)) # bsz x 1
+        ut.get_logger().info("P(good): {}".format(pg))
+        pg = 0.5 + 0.5*pg
+        pg = torch.log(pg)
+        logits = self.logit_fn(decoder_outputs) # bsz x vocab
+        neglprobs = F.log_softmax(logits, -1) + pg.reshape(-1, 1)
         neglprobs = neglprobs * self.trg_vocab_mask.type(neglprobs.type()).reshape(1, -1)
         targets = targets.reshape(-1, 1)
         non_pad_mask = targets != ac.PAD_ID
@@ -133,7 +141,7 @@ class Model(nn.Module):
         logits[:, ~self.trg_vocab_mask] = -1e9
         return logits
 
-    def beam_decode(self, src_toks):
+    def beam_decode(self, src_toks, mode='best', beam_size=None, max_len=None):
         """Translate a minibatch of sentences. 
 
         Arguments: src_toks[i,j] is the jth word of sentence i.
@@ -157,15 +165,26 @@ class Model(nn.Module):
             return word_embeds + pos_embeds
 
         def logprob(decoder_output):
-            return F.log_softmax(self.logit_fn(decoder_output), dim=-1)
+            lp = F.log_softmax(self.logit_fn(decoder_output), dim=-1)
+            pg = F.sigmoid(self.bad_affine(decoder_output))
+            ut.get_logger().info("P(good): {}".format(pg))
+            pg = 0.5 + 0.5*pg
+            pg = torch.log(pg)
+
+            return lp + pg.reshape(-1, 1)
 
         if self.config['length_model'] == 'gnmt':
             length_model = ut.gnmt_length_model(self.config['length_alpha'])
         elif self.config['length_model'] == 'linear':
             length_model = lambda t, p: p + self.config['length_alpha'] * t
+        elif self.config['length_model'] == 'linear_learned':
+            length_model = lambda t, p: p + self.length_reward * t
         elif self.config['length_model'] == 'none':
             length_model = lambda t, p: p
         else:
             raise ValueError("invalid length_model '{}'".format(self.config['length_model']))
 
-        return self.decoder.beam_decode(encoder_outputs, encoder_mask, get_trg_inp, logprob, length_model, ac.BOS_ID, ac.EOS_ID, max_lengths, beam_size=self.config['beam_size'])
+        if beam_size is None:
+            beam_size = self.config['beam_size']
+
+        return self.decoder.beam_decode(encoder_outputs, encoder_mask, get_trg_inp, logprob, length_model, ac.BOS_ID, ac.EOS_ID, max_lengths, beam_size=beam_size, mode=mode)

@@ -67,9 +67,12 @@ def base_config():
 
     ### Dropout/smoothing options
 
-    config['dropout']           = 0.3
-    config['word_dropout']      = 0.1
-    config['label_smoothing']   = 0.1
+    #config['dropout']           = 0.3
+    #config['word_dropout']      = 0.1
+    config['dropout']           = 0.
+    config['word_dropout']      = 0.
+    #config['label_smoothing']   = 0.1
+    config['label_smoothing']   = 0.
 
     ### Training options
 
@@ -117,7 +120,7 @@ def base_config():
     # - gnmt: https://arxiv.org/abs/1609.08144 equation 14
     # - linear: constant reward per word
     # - none
-    config['length_model']      = 'gnmt'
+    config['length_model']      = 'linear'
     # For gnmt, this is the exponent; for linear, this is the strength of the reward
     config['length_alpha']      = 0.6
 
@@ -301,6 +304,32 @@ def hu2en():
     config['src_lang']          = 'hu'
     config['trg_lang']          = 'en'
     config['data_dir']          = './nmt/data/hu2en'
+    config['val_trans_out']     = os.path.join(config['save_to'], 'validation_trans.txt')
+    config['val_beam_out']      = os.path.join(config['save_to'], 'beam_trans.txt')
+    return config
+
+
+def ur2en():
+    config = base_config()
+
+    config['model_name']        = 'ur2en'
+    config['save_to']           = './nmt/saved_models/{}'.format(config['model_name'])
+    config['src_lang']          = 'ur'
+    config['trg_lang']          = 'en'
+    config['data_dir']          = './nmt/data/ur2en'
+    config['val_trans_out']     = os.path.join(config['save_to'], 'validation_trans.txt')
+    config['val_beam_out']      = os.path.join(config['save_to'], 'beam_trans.txt')
+    return config
+
+
+def ta2en():
+    config = base_config()
+
+    config['model_name']        = 'ta2en'
+    config['save_to']           = './nmt/saved_models/{}'.format(config['model_name'])
+    config['src_lang']          = 'ta'
+    config['trg_lang']          = 'en'
+    config['data_dir']          = './nmt/data/ta2en'
     config['val_trans_out']     = os.path.join(config['save_to'], 'validation_trans.txt')
     config['val_beam_out']      = os.path.join(config['save_to'], 'beam_trans.txt')
     return config

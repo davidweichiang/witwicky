@@ -4,6 +4,8 @@ import torch.nn.functional as F
 
 from layers import Attention, PositionWiseFeedForward
 
+import logging
+logger = logging.getLogger("witwicky")
 
 class Encoder(nn.Module):
     """Self-attention Encoder"""
@@ -169,13 +171,20 @@ class Decoder(nn.Module):
 
         return x
 
-    def beam_decode(self, encoder_out, encoder_mask, get_input_fn, logprob_fn, length_fn, bos_id, eos_id, max_len, beam_size=4):
+    def beam_decode(self, encoder_out, encoder_mask, get_input_fn, logprob_fn, length_fn, bos_id, eos_id, max_len, beam_size=4, mode="best"):
         """
+        Arguments:
+        - mode:
+          * "best" = try to find beam_size best hypotheses
+          * "random" = sample beam_size random hypotheses
         Return: a list of dicts
         - ret[i]['symbols'][j][k] is the kth word of jth translation of sentence i
         - ret[i]['probs'][j] is the log-probability of the jth translation of sentence i
         - ret[i]['scores'][j] is the score (including length penalty) of the jth translation of sentence i
         """
+
+        #torch.autograd.set_detect_anomaly(True)
+
         # first step, beam=1
         batch_size = encoder_out.size()[0]
 
@@ -190,12 +199,22 @@ class Decoder(nn.Module):
         # Compute log-probabilities of all extensions of initial hyps
         y = self.beam_step(inp, cache).squeeze_(1) # [bsz, D]
         probs = logprob_fn(y) # [bsz, V]
-        probs[:, eos_id] = float('-inf') # no <eos> now to avoid empty output
+        #probs[:, eos_id] = float('-inf') # no <eos> now to avoid empty output
+        vocab_range = torch.arange(probs.size()[1], device=probs.device)
+        probs = probs.masked_fill((vocab_range == eos_id), float('-inf'))
 
         # Length penalty not needed, because all lengths are 1
 
-        # Select top k hyps to survive to the next time step
-        all_probs, symbols = torch.topk(probs, beam_size, dim=-1) # ([bsz, beam], [bsz, beam])
+        if mode == "best":
+            # Select top k hyps to survive to the next time step
+            all_probs, symbols = torch.topk(probs, beam_size, dim=-1) # ([bsz, beam], [bsz, beam])
+        elif mode in ["random_particle", "random_beam"]:
+            symbols = multinomial(probs, beam_size)
+            all_probs = torch.gather(probs, -1, symbols)
+            if mode == "random_particle":
+                sample_weights = 0.
+        else:
+            raise ValueError("Invalid mode '{}'".format(mode))
 
         last_probs = all_probs.reshape(batch_size, beam_size)
         last_scores = last_probs.clone()
@@ -209,7 +228,7 @@ class Decoder(nn.Module):
             cache[i]['enc_dec_v'] = cache[i]['enc_dec_v'].expand(-1, beam_size, -1, -1)
 
         num_classes = probs.size()[-1] # V
-        not_eos_mask = (torch.arange(num_classes).reshape(1, -1) != eos_id).type(encoder_mask.type())
+        not_eos_mask = (vocab_range.reshape(1, -1) != eos_id).type(encoder_mask.type())
         maximum_length = max_len.max().item()
         ret = [None] * batch_size
         batch_idxs = torch.arange(batch_size)
@@ -227,6 +246,8 @@ class Decoder(nn.Module):
                             'probs': last_probs[j].clone(),
                             'scores': last_scores[j].clone()
                         }
+                        if mode == "random_particle":
+                            ret[batch_idxs[j]]['weights'] = F.softmax(sample_weights[j], 0).detach()
 
                 all_symbols = all_symbols[~finished_sents]
                 last_probs = last_probs[~finished_sents]
@@ -250,10 +271,10 @@ class Decoder(nn.Module):
             inps = get_input_fn(last_symbols, time_step).reshape(bsz * beam_size, -1).unsqueeze_(1) # [bsz x beam, 1, D]
             ys = self.beam_step(inps, cache).squeeze_(1) # [bsz x beam, D]
             probs = logprob_fn(ys) # [bsz x beam, V]
-            last_probs = last_probs.reshape(-1, 1) # [bsz x beam, 1]
-            last_scores = last_scores.reshape(-1, 1)
+            last_probs = last_probs.reshape(-1, 1)   # [bsz x beam, 1]
+            last_scores = last_scores.reshape(-1, 1) # [bsz x beam, 1]
 
-            # Finished hypotheses are zeroed out
+            # Finished hypotheses continue with EOS (with no additional log-prob)
             # For unfinished hypotheses, update log-probs and scores
             finished_mask = (last_symbols.reshape(-1) == eos_id).type(encoder_mask.type())
             beam_probs = probs.clone()
@@ -263,26 +284,76 @@ class Decoder(nn.Module):
             else:
                 beam_probs = last_probs + probs
 
+            # Compute scores including length penalty
             beam_scores = beam_probs.clone()
             if finished_mask.any():
                 beam_scores[finished_mask] = last_scores[finished_mask].expand(-1, num_classes).masked_fill(not_eos_mask, float('-inf'))
-                beam_scores[~finished_mask] = length_fn(time_step, beam_probs[~finished_mask])
+                beam_scores[~finished_mask] = length_fn(time_step+1, beam_probs[~finished_mask])
             else:
-                beam_scores = length_fn(time_step, beam_probs)
+                beam_scores = length_fn(time_step+1, beam_probs)
 
-            # Select top k hypotheses to survive to next time step
-            beam_probs = beam_probs.reshape(bsz, -1)   # [bsz, beam x V]
-            beam_scores = beam_scores.reshape(bsz, -1) # [bsz, beam x V]
-            max_scores, idxs = torch.topk(beam_scores, beam_size, dim=-1) # ([bsz, beam], [bsz, beam])
-            parent_idxs = idxs // num_classes
-            symbols = (idxs - parent_idxs * num_classes).type(idxs.type()) # [bsz, beam]
+            if mode == "best":
+                beam_probs = beam_probs.reshape(bsz, -1)   # [bsz, beam x V]
+                beam_scores = beam_scores.reshape(bsz, -1) # [bsz, beam x V]
 
-            last_probs = torch.gather(beam_probs, -1, idxs)
-            last_scores = max_scores
+                # Select top k hypotheses to survive to next time step
+                max_scores, idxs = torch.topk(beam_scores, beam_size, dim=-1) # ([bsz, beam], [bsz, beam])
+                parent_idxs = idxs // num_classes
+                symbols = (idxs - parent_idxs * num_classes).type(idxs.type()) # [bsz, beam]
+                last_probs = torch.gather(beam_probs, -1, idxs) # [bsz, beam]
+                last_scores = max_scores
+
+            elif mode == "random_particle":
+                # Sample words from proposal distribution
+                # to do: use score ratio instead of probs
+                # but does it make any difference since all hyps are same length?
+                # prop_probs = beam_scores-last_scores
+                prop_probs = F.log_softmax(probs.detach())
+                if finished_mask.any():
+                    prop_probs[finished_mask, :] = float('-inf')
+                    prop_probs[finished_mask, eos_id] = 0.
+                symbols = multinomial(prop_probs, 1)   # [bsz x beam, 1]
+                sample_prop_probs = torch.gather(prop_probs, 1, symbols) # [bsz x beam, 1]
+                sample_scores = torch.gather(beam_scores, 1, symbols)   # [bsz x beam, 1]
+                parent_idxs = torch.arange(beam_size, device=symbols.device).unsqueeze(0)      # [1, beam]
+
+                # Reweight
+                alpha = sample_scores - last_scores - sample_prop_probs             # [bsz x beam, 1]
+                sample_weights += alpha.reshape(bsz, beam_size)    # [bsz, beam]
+
+                symbols = symbols.reshape(bsz, -1)
+                beam_probs = beam_probs.reshape(bsz, -1)
+                beam_scores = beam_scores.reshape(bsz, -1)
+
+                # Maybe resample
+                ess = torch.exp(torch.logsumexp(sample_weights, -1, True)*2 -
+                                torch.logsumexp(sample_weights*2, -1, True))     # [bsz, 1]
+                criterion = ess<beam_size/2                              # [bsz, 1]
+                if torch.any(criterion):
+                    resamples = multinomial(sample_weights, beam_size)    # [bsz, beam]
+                    symbols = torch.where(criterion, torch.gather(symbols, -1, resamples), symbols) # [bsz, beam]
+                    parent_idxs = torch.where(criterion, resamples, parent_idxs)
+                    sample_weights = sample_weights.masked_fill_(criterion, 0.)
+
+                idxs = parent_idxs * num_classes + symbols
+                last_probs = torch.gather(beam_probs, -1, idxs)
+                last_scores = torch.gather(beam_scores, -1, idxs)
+
+            elif mode == "random_beam":
+                # Select random beam_size hypotheses to survive to next time step
+                delta_scores = (beam_scores - last_scores).reshape(bsz, -1) # [bsz, beam x V]
+                beam_probs = beam_probs.reshape(bsz, -1)   # [bsz, beam x V]
+                beam_scores = beam_scores.reshape(bsz, -1)                  # [bsz, beam x V]
+                idxs = torch.multinomial(torch.exp(delta_scores), beam_size, replacement=True)
+                last_probs = torch.gather(beam_probs, -1, idxs) # [bsz, beam]
+                last_scores = torch.gather(beam_scores, -1, idxs)           # [bsz, beam]
+                parent_idxs = idxs // num_classes
+                symbols = (idxs - parent_idxs * num_classes).type(idxs.type()) # [bsz, beam]
+
             parent_idxs = parent_idxs + torch.arange(bsz).unsqueeze_(1).type(parent_idxs.type()) * beam_size
             parent_idxs = parent_idxs.reshape(-1)
             all_symbols = all_symbols.reshape(bsz * beam_size, -1)[parent_idxs].reshape(bsz, beam_size, -1)
-            all_symbols = torch.cat((all_symbols, symbols.unsqueeze_(-1)), -1)
+            all_symbols = torch.cat((all_symbols, symbols.unsqueeze(-1)), -1)
 
             for i in range(self.num_layers):
                 seq_len = cache[i]['self_att']['k'].size()[2]
@@ -298,5 +369,13 @@ class Decoder(nn.Module):
                     'probs': last_probs[j].clone(),
                     'scores': last_scores[j].clone()
                 }
+                if mode == "random_particle":
+                    ret[batch_idxs[j]]['weights'] = F.softmax(sample_weights[j], 0).detach()
 
         return ret
+
+def multinomial(input, num_samples):
+    linear = F.softmax(input, -1)
+    if torch.any(torch.isnan(linear)):
+        raise ValueError("log-probabilities all -inf: {}".format(input))
+    return torch.multinomial(linear, num_samples, replacement=True)
